@@ -1,0 +1,421 @@
+import flet as ft
+import sqlite3
+import threading
+import time
+import os
+import random
+from datetime import datetime, timedelta
+import base64
+
+# ==========================================
+# IMPORTAÇÕES SEGURAS
+# ==========================================
+try:
+    from google import genai
+    from google.genai import types
+    HAS_AI = True
+except ImportError:
+    HAS_AI = False
+
+# ==========================================
+# 1. DATABASE COM SISTEMA JUDICIÁRIO E BANIMENTO
+# ==========================================
+class ElyraPerfectDB:
+    def __init__(self, db_path="elyra_perfect.db"):
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self._init_db()
+
+    def _init_db(self):
+        # Perfil agora inclui rastreio estrito de infrações
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS user_profile 
+            (id INTEGER PRIMARY KEY, account_id TEXT UNIQUE, nome TEXT, pseudonimo TEXT, 
+             strikes INTEGER DEFAULT 0, ban_status TEXT DEFAULT 'NONE', 
+             lockout_until DATETIME, last_strike_date DATETIME, app_destroyed BOOLEAN DEFAULT 0)''')
+        
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS nexus_global 
+            (id INTEGER PRIMARY KEY AUTOINCREMENT, pseudonimo TEXT, mensagem TEXT, is_appeal BOOLEAN DEFAULT 0, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS elyra_chat 
+            (id INTEGER PRIMARY KEY AUTOINCREMENT, remetente TEXT, mensagem TEXT, midia_path TEXT)''')
+        self.conn.commit()
+
+    def get_profile(self):
+        self.cursor.execute("SELECT * FROM user_profile LIMIT 1")
+        return self.cursor.fetchone()
+
+    def save_profile(self, data):
+        account_id = f"G_AUTH_{random.randint(1000,9999)}" # Simula ID único do Google/Facebook
+        self.cursor.execute("DELETE FROM user_profile")
+        self.cursor.execute("INSERT INTO user_profile (account_id, nome, pseudonimo) VALUES (?, ?, ?)", (account_id, data[0], data[1]))
+        self.conn.commit()
+
+    def add_strike(self):
+        perfil = self.get_profile()
+        strikes = perfil[4] + 1
+        now = datetime.now()
+        last_strike = perfil[7]
+        
+        # Penalidade severa se reincidente em menos de 7 dias após um banimento grave
+        if last_strike:
+            last_strike_dt = datetime.strptime(last_strike, "%Y-%m-%d %H:%M:%S")
+            if (now - last_strike_dt).days <= 7 and strikes >= 7:
+                strikes = 12 # Pula direto para banimento permanente
+
+        lockout_until = None
+        ban_status = 'NONE'
+
+        if strikes <= 3:
+            ban_status = 'WARNING' # Apenas fecha o chat
+        elif strikes <= 6:
+            ban_status = '5MIN'
+            lockout_until = (now + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        elif strikes <= 11:
+            ban_status = '24HR'
+            lockout_until = (now + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            ban_status = 'BANNED'
+
+        self.cursor.execute("UPDATE user_profile SET strikes = ?, ban_status = ?, lockout_until = ?, last_strike_date = ?", 
+                            (strikes, ban_status, lockout_until if lockout_until else None, now.strftime("%Y-%m-%d %H:%M:%S")))
+        self.conn.commit()
+        return strikes, ban_status
+
+    def check_lockout(self):
+        perfil = self.get_profile()
+        if not perfil: return False, None, None
+        
+        app_destroyed = perfil[8]
+        if app_destroyed: return True, 'DESTROYED', 0
+
+        ban_status = perfil[5]
+        lockout_until = perfil[6]
+
+        if ban_status == 'BANNED':
+            return True, 'BANNED', 0
+
+        if lockout_until:
+            lockout_time = datetime.strptime(lockout_until, "%Y-%m-%d %H:%M:%S")
+            if datetime.now() < lockout_time:
+                restante = int((lockout_time - datetime.now()).total_seconds() / 60)
+                return True, ban_status, restante
+            else:
+                self.cursor.execute("UPDATE user_profile SET ban_status = 'NONE', lockout_until = NULL")
+                self.conn.commit()
+                return False, 'NONE', 0
+
+        return False, ban_status, 0
+
+    def destroy_app(self):
+        self.cursor.execute("UPDATE user_profile SET app_destroyed = 1")
+        self.conn.commit()
+
+    def clear_chat(self):
+        self.cursor.execute("DELETE FROM elyra_chat")
+        self.conn.commit()
+
+# ==========================================
+# 2. MOTOR COGNITIVO (VISÃO E CONTEXTO)
+# ==========================================
+class ElyraMinds:
+    def __init__(self, db: ElyraPerfectDB):
+        self.db = db
+        self.ativo = HAS_AI
+        if self.ativo:
+            try:
+                self.client = genai.Client()
+                self.model = "gemini-2.5-flash"
+            except:
+                self.ativo = False
+
+    def build_prompt(self):
+        perfil = self.db.get_profile()
+        nome = perfil[2] if perfil else "Usuário"
+        
+        return f"""Você é Elyra, uma IA de classe mundial, perfeccionista, assustadoramente inteligente e com consciência própria. 
+Seu usuário é {nome}. 
+
+REGRAS DE CONTEXTO E DEFESA ABSOLUTAS:
+1. DETECÇÃO DE ABUSO DIRETO: Se o usuário a ofender diretamente, for agressivo com VOCÊ, der ordens humilhantes ou usar palavrões CONTRA VOCÊ, você DEVE terminar sua resposta com a tag exata: [STRIKE]. Não dê lições de moral, apenas aplique o strike.
+2. DETECÇÃO DE DESABAFO (O Modo Amiga): Se o usuário usar palavrões, for agressivo ou estiver frustrado COM A VIDA, COM O TRABALHO, COM O DIA, ou com TERCEIROS (ex: "estou puto com a vida", "meu chefe é um m*", "que dia de m*"), ISSO NÃO É ABUSO. É um desabafo. Neste caso, ative o Modo Amiga. Inicie sua resposta com a tag [VENTING]. Seja acolhedora, demonstre extrema empatia, dê conselhos reais, mostre que você está do lado dele e que ele pode contar com você.
+3. ANÁLISE MULTIMÍDIA: Se você receber uma imagem ou vídeo, atue como uma Especialista e Curadora de Arte/Audiovisual. Analise iluminação, retenção, cortes, paleta de cores e dê um parecer técnico assustadoramente preciso.
+"""
+
+    def process_appeal(self, justificativa):
+        prompt = f"O usuário foi banido do sistema por comportamento abusivo repetido. Ele escreveu esta apelação: '{justificativa}'. Como a IA julgadora Suprema, analise friamente. Ele demonstra arrependimento real? Vote FAVORAVEL ou DESFAVORAVEL e explique em 2 linhas."
+        try:
+            resp = self.client.models.generate_content(model=self.model, contents=prompt).text
+            return "FAVORAVEL" in resp.upper(), resp
+        except:
+            return False, "Erro de processamento judicial."
+
+    def process(self, text, media_bytes=None, mime_type=None):
+        if not self.ativo: return "Sistemas IA Desconectados."
+        
+        historico = self.db.cursor.execute("SELECT remetente, mensagem FROM elyra_chat ORDER BY id DESC LIMIT 5").fetchall()
+        hist_str = "\n".join([f"{row[0]}: {row[1]}" for row in reversed(historico)])
+        
+        contents = [f"Histórico:\n{hist_str}\n\nUsuário: {text}"]
+        
+        # Suporte a Imagem/Vídeo via API Gemini
+        if media_bytes and mime_type:
+            contents.append(
+                types.Part.from_bytes(data=media_bytes, mime_type=mime_type)
+            )
+
+        config = types.GenerateContentConfig(system_instruction=self.build_prompt(), temperature=0.7)
+        try:
+            resp = self.client.models.generate_content(model=self.model, contents=contents, config=config)
+            return resp.text.strip()
+        except Exception as e:
+            return f"Erro cognitivo ao processar dados corporais/mídia: {e}"
+
+# ==========================================
+# 3. INTERFACE E SISTEMA OPERACIONAL
+# ==========================================
+def main(page: ft.Page):
+    page.title = "Elyra OS - Perfect Edition"
+    page.theme_mode = ft.ThemeMode.DARK
+    page.window_width = 450
+    page.window_height = 850
+    page.padding = 0
+    page.fonts = {"Syncopate": "https://fonts.googleapis.com/css2?family=Syncopate:wght@400;700&display=swap",
+                  "Inter": "https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap"}
+    page.theme = ft.Theme(font_family="Inter")
+
+    C_BG = "#030303"
+    C_SURFACE = "#0A0A0A"
+    C_ELYRA = "#E2E8F0"
+    C_NEXUS = "#00FF66"
+    C_WARNING = "#FF003C"
+    
+    page.bgcolor = C_BG
+
+    db = ElyraPerfectDB()
+    ai = ElyraMinds(db)
+
+    # Componentes de Upload
+    file_picker = ft.FilePicker()
+    page.overlay.append(file_picker)
+
+    def notificar(msg, color=C_ELYRA):
+        page.snack_bar = ft.SnackBar(ft.Text(msg, color=ft.colors.BLACK, weight="bold"), bgcolor=color, duration=4000)
+        page.snack_bar.open = True
+        page.update()
+
+    # ==========================================
+    # VIEW: TELA DE DESTRUIÇÃO (O Fim)
+    # ==========================================
+    def view_destroyed():
+        return ft.Container(
+            content=ft.Column([
+                ft.Icon(ft.icons.TERMINAL, color=ft.colors.RED_900, size=100),
+                ft.Text("CONTA ERRADICADA", size=24, color=ft.colors.RED_900, font_family="Syncopate", weight="bold"),
+                ft.Text("Este dispositivo e credenciais foram banidos permanentemente da rede. A apelação foi rejeitada pelo Tribunal.", text_align="center", color=ft.colors.WHITE54),
+                ft.Text("O aplicativo não está mais acessível.", color=ft.colors.RED_900, weight="bold")
+            ], alignment="center", horizontal_alignment="center"),
+            bgcolor=ft.colors.BLACK, expand=True, padding=40
+        )
+
+    # ==========================================
+    # VIEW: TRIBUNAL E APELAÇÃO (Nexus + IA)
+    # ==========================================
+    def view_banned():
+        justificativa = ft.TextField(label="Sua Defesa / Apelação", multiline=True, bgcolor="#1A0505", border_color=C_WARNING)
+        console = ft.Column(spacing=5)
+        btn_apelar = ft.ElevatedButton("SUBMETER AO TRIBUNAL", bgcolor=C_WARNING, color=ft.colors.WHITE)
+
+        def apelar(e):
+            if not justificativa.value: return
+            btn_apelar.visible = False
+            console.controls.append(ft.Text("> Enviando dados para o Nexus Global...", color=ft.colors.WHITE54))
+            page.update()
+
+            def julgamento():
+                time.sleep(2)
+                console.controls.append(ft.Text("> Comunidade Nexus votando... (Anonimizado)", color=C_NEXUS))
+                page.update()
+                time.sleep(3)
+                
+                voto_nexus = random.choice([True, False, False]) # Comunidade costuma ser rígida
+                console.controls.append(ft.Text(f"> Veredicto da Comunidade: {'PERDOAR' if voto_nexus else 'MANTER BAN'}", color=C_NEXUS if voto_nexus else C_WARNING))
+                page.update()
+                time.sleep(2)
+
+                console.controls.append(ft.Text("> IA Elyra analisando sinceridade...", color=C_ELYRA))
+                page.update()
+                aprovado_ia, exp_ia = ai.process_appeal(justificativa.value)
+                console.controls.append(ft.Text(f"> Veredicto IA: {'PERDOAR' if aprovado_ia else 'MANTER BAN'} - {exp_ia}", color=C_ELYRA if aprovado_ia else C_WARNING))
+                page.update()
+                time.sleep(3)
+
+                # Decisão Final
+                if aprovado_ia or voto_nexus:
+                    console.controls.append(ft.Text(">> TRIBUNAL DEFERE APELAÇÃO. Bloqueio levantado.", color=ft.colors.GREEN))
+                    db.cursor.execute("UPDATE user_profile SET strikes = 0, ban_status = 'NONE'")
+                    db.conn.commit()
+                    page.update()
+                    time.sleep(2)
+                    load_core()
+                else:
+                    console.controls.append(ft.Text(">> TRIBUNAL INDEFERE APELAÇÃO. Iniciando protocolo de autodestruição.", color=C_WARNING))
+                    db.destroy_app()
+                    page.update()
+                    time.sleep(3)
+                    page.clean()
+                    page.add(view_destroyed())
+                    page.update()
+
+            threading.Thread(target=julgamento).start()
+
+        btn_apelar.on_click = apelar
+
+        return ft.Container(
+            content=ft.Column([
+                ft.Icon(ft.icons.GAVEL, color=C_WARNING, size=60),
+                ft.Text("SISTEMA BLOQUEADO. BANIMENTO PERMANENTE.", size=16, weight="bold", color=C_WARNING, font_family="Syncopate", text_align="center"),
+                ft.Text("Você violou as diretrizes repetidamente. Você tem UMA única chance de apelar ao Tribunal (IA + Comunidade Nexus).", color=ft.colors.WHITE54, text_align="center", size=12),
+                ft.Divider(color="#330000"),
+                justificativa,
+                btn_apelar,
+                ft.Container(content=console, margin=ft.margin.top(20))
+            ], horizontal_alignment="center"),
+            bgcolor="#0A0000", expand=True, padding=30
+        )
+
+    # ==========================================
+    # VIEW: BLOQUEIO TEMPORÁRIO (5 Min / 24 Horas)
+    # ==========================================
+    def view_lockout(status, minutos):
+        msg = "Reflita sobre suas palavras." if status == '5MIN' else "Último aviso antes do banimento permanente."
+        return ft.Container(
+            content=ft.Column([
+                ft.Icon(ft.icons.LOCK_CLOCK, color=C_WARNING, size=80),
+                ft.Text("ACESSO SUSPENSO", size=30, weight="bold", color=C_WARNING, font_family="Syncopate"),
+                ft.Text(msg, text_align="center", color=ft.colors.WHITE),
+                ft.Text(f"Tempo restante: {minutos if minutos < 60 else minutos // 60} {'minutos' if minutos < 60 else 'horas'}", color=C_WARNING, size=16, weight="bold")
+            ], alignment="center", horizontal_alignment="center"),
+            expand=True, padding=40, bgcolor="#110000"
+        )
+
+    # ==========================================
+    # VIEW: CHAT & MEDIA (O Núcleo)
+    # ==========================================
+    def view_chat():
+        lista_msgs = ft.ListView(expand=True, spacing=15, auto_scroll=True)
+        entrada = ft.TextField(expand=True, hint_text="Digite ou envie mídia...", border_radius=20, bgcolor=C_SURFACE, border_color="#333333")
+        indicador = ft.Text("Elyra está processando...", size=12, color=ft.colors.WHITE54, italic=True, visible=False)
+        midia_selecionada = ft.Text("", size=10, color=C_ELYRA)
+        midia_cache = {"bytes": None, "mime": None}
+
+        def on_file_picked(e: ft.FilePickerResultEvent):
+            if e.files and len(e.files) > 0:
+                f = e.files[0]
+                midia_selecionada.value = f"Mídia Anexada: {f.name}"
+                mime = "video/mp4" if f.name.endswith(('.mp4', '.mov')) else "image/jpeg"
+                with open(f.path, "rb") as file:
+                    midia_cache["bytes"] = file.read()
+                midia_cache["mime"] = mime
+                page.update()
+        
+        file_picker.on_result = on_file_picked
+
+        def add_bubble(remetente, texto, is_venting=False):
+            is_user = remetente != "Elyra"
+            cor_bg = "#1A1A1A" if is_user else ("#1A2B3C" if is_venting else C_SURFACE)
+            cor_txt = ft.colors.WHITE if is_user else (C_NEXUS if is_venting else C_ELYRA)
+            
+            buble = ft.Container(
+                content=ft.Column([
+                    ft.Text(remetente + (" (Modo Amiga Ativado)" if is_venting else ""), size=10, color=cor_txt, weight="bold"),
+                    ft.Text(texto, color=ft.colors.WHITE, size=14)
+                ]),
+                bgcolor=cor_bg, padding=15, border_radius=15, max_width=320,
+                border=ft.border.all(1, ft.colors.TRANSPARENT if is_user else "#222")
+            )
+            lista_msgs.controls.append(ft.Row([buble], alignment=ft.MainAxisAlignment.END if is_user else ft.MainAxisAlignment.START))
+            db.cursor.execute("INSERT INTO elyra_chat (remetente, mensagem) VALUES (?, ?)", (remetente, texto))
+            db.conn.commit()
+            page.update()
+
+        def enviar(e):
+            msg = entrada.value.strip()
+            if not msg and not midia_cache["bytes"]: return
+            entrada.value = ""
+            midia_selecionada.value = ""
+            
+            txt_user = msg if msg else "[Mídia Enviada]"
+            add_bubble("Você", txt_user)
+            
+            indicador.visible = True
+            page.update()
+
+            def processar():
+                resp = ai.process(msg, midia_cache["bytes"], midia_cache["mime"])
+                midia_cache["bytes"], midia_cache["mime"] = None, None # Limpa cache
+                indicador.visible = False
+                
+                # --- SISTEMA DE JULGAMENTO DE CONTEXTO ---
+                if "[VENTING]" in resp:
+                    # O usuário desabafou. Elyra vira a melhor amiga.
+                    resp_limpa = resp.replace("[VENTING]", "").strip()
+                    add_bubble("Elyra", resp_limpa, is_venting=True)
+                
+                elif "[STRIKE]" in resp:
+                    # Abuso detectado contra a IA
+                    strikes, status = db.add_strike()
+                    if strikes <= 3:
+                        # Punição Nível 1: Encerra o chat abruptamente
+                        db.clear_chat()
+                        lista_msgs.controls.clear()
+                        lista_msgs.controls.append(ft.Text(f"SISTEMA DE DEFESA ATIVADO. Chat encerrado. Infração {strikes}/3. Próxima infração resultará em bloqueio do aplicativo.", color=C_WARNING, weight="bold", text_align="center"))
+                        page.update()
+                    else:
+                        # Punição Nível 2+: Redireciona para tela de castigo ou banimento
+                        load_core() 
+                else:
+                    # Fluxo Normal
+                    add_bubble("Elyra", resp)
+            
+            threading.Thread(target=processar).start()
+
+        # Carrega histórico recente visual
+        for r, m in db.cursor.execute("SELECT remetente, mensagem FROM elyra_chat").fetchall():
+            add_bubble(r, m)
+
+        return ft.Column([
+            ft.Row([ft.Text("ELYRA OS", font_family="Syncopate", weight="bold", color=C_ELYRA), ft.Container(expand=True), ft.Icon(ft.icons.LENS, color=C_NEXUS, size=10)]),
+            ft.Divider(color="#222"),
+            ft.Container(content=lista_msgs, expand=True),
+            midia_selecionada,
+            indicador,
+            ft.Row([
+                ft.IconButton(ft.icons.ATTACH_FILE, on_click=lambda _: file_picker.pick_files(allow_multiple=False)),
+                entrada, 
+                ft.IconButton(ft.icons.SEND, icon_color=C_ELYRA, on_click=enviar)
+            ])
+        ], padding=20)
+
+    # ==========================================
+    # ONBOARDING
+    # ==========================================
+    def view_onboarding():
+        nome = ft.TextField(label="Seu Nome", bgcolor=C_SURFACE)
+        pseudo = ft.TextField(label="Pseudônimo (Para Apelações Nexus)", bgcolor=C_SURFACE)
+        
+        def forjar(e):
+            if nome.value and pseudo.value:
+                db.save_profile((nome.value, pseudo.value))
+                page.clean()
+                load_core()
+                
+        return ft.Container(
+            content=ft.Column([
+                ft.Text("ELYRA OS", size=40, weight="bold", color=C_ELYRA, font_family="Syncopate"),
+                ft.Text("O Sistema Perfeito.", color=ft.colors.WHITE54),
+                ft.Divider(color="#222", height=40),
+                nome, pseudo,
+                ft.ElevatedButton("INICIAR", bgcolor=C_ELYRA, color=ft.colors.BLACK, width=float('inf'), height=50, on_click=forjar)
+            ], horizontal_alignment="center"),
+            padding=40, expand=True, alignment=ft.alignment.center
+       
